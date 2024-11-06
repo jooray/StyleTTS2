@@ -186,6 +186,7 @@ class StyleTTS2:
                   output_sample_rate=24000,
                   alpha=0.3,
                   beta=0.7,
+                  t=0.7,
                   diffusion_steps=5,
                   embedding_scale=1,
                   ref_s=None,
@@ -198,6 +199,7 @@ class StyleTTS2:
         :param output_sample_rate: Output sample rate (default 24000).
         :param alpha: Determines timbre of speech, higher means style is more suitable to text than to the target voice.
         :param beta: Determines prosody of speech, higher means style is more suitable to text than to the target voice.
+        :param t: Determines the consistency of the style across different segments of the long-form text
         :param diffusion_steps: The more the steps, the more diverse the samples are, with the cost of speed.
         :param embedding_scale: Higher scale means style is more conditional to the input text and hence more emotional.
         :param ref_s: Pre-computed style vector to pass directly.
