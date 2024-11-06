@@ -1,5 +1,6 @@
 from gruut import sentences
 from collections.abc import Iterable
+import phonemizer
 
 
 class PhonemeConverter:
@@ -19,6 +20,16 @@ class GruutPhonemizer(PhonemeConverter):
         phonemized_text = ' '.join(phonemized)
         return phonemized_text
 
+class EspeakPhonemizer(PhonemeConverter):
+    def __init__(self):
+        self.phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
+    def phonemize(self, text, lang='en-us'):
+        return self.phonemizer.phonemize([text])[0]
+
+
+
+
+
 
 # class YourPhonemizer(Phonemizer):
 #     def phonemize(self, text):
@@ -30,5 +41,7 @@ class PhonemeConverterFactory:
     def load_phoneme_converter(name: str, **kwargs):
         if name == 'gruut':
             return GruutPhonemizer()
+        elif name == 'espeak':
+            return EspeakPhonemizer()
         else:
             raise ValueError("Invalid phoneme converter.")
