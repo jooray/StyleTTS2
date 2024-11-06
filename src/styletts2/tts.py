@@ -204,182 +204,43 @@ class StyleTTS2:
         :param phonemize: Phonemize text. Defaults to True.
         :return: audio data as a Numpy array (will also create the WAV file if output_wav_file was set).
         """
+        if ref_s is None:
+            # default to clone https://styletts2.github.io/wavs/LJSpeech/OOD/GT/00001.wav voice from LibriVox (public domain)
+            if not target_voice_path or not Path(target_voice_path).exists():
+                print("Cloning default target voice...")
+                target_voice_path = cached_path(DEFAULT_TARGET_VOICE_URL)
+            ref_s = self.compute_style(target_voice_path)  # target style vector
 
-        # BERT model is limited by a tensor size [1, 512] during its inference, which roughly corresponds to ~450 characters
         if len(text) > SINGLE_INFERENCE_MAX_LEN:
-            return self.long_inference(text,
-                                       target_voice_path=target_voice_path,
-                                       output_wav_file=output_wav_file,
-                                       output_sample_rate=output_sample_rate,
-                                       alpha=alpha,
-                                       beta=beta,
-                                       diffusion_steps=diffusion_steps,
-                                       embedding_scale=embedding_scale,
-                                       ref_s=ref_s,
-                                       phonemize=phonemize)
-
-        if ref_s is None:
-            # default to clone https://styletts2.github.io/wavs/LJSpeech/OOD/GT/00001.wav voice from LibriVox (public domain)
-            if not target_voice_path or not Path(target_voice_path).exists():
-                print("Cloning default target voice...")
-                target_voice_path = cached_path(DEFAULT_TARGET_VOICE_URL)
-            ref_s = self.compute_style(target_voice_path)  # target style vector
-
-        # TODO: Clarifying text pre-processing
-        if phonemize:
-            text = text.strip()
-            text = text.replace('"', '')
-            phonemized_text = self.phoneme_converter.phonemize(text)
-            ps = word_tokenize(phonemized_text)
-            phoneme_string = ' '.join(ps)
+            text_segments = segment_text(text)
+            segments = []
+            prev_s = None
+            for text_segment in text_segments:
+                # Address cut-off sentence issue due to langchain text splitter
+                if text_segment[-1] != '.':
+                    text_segment += ', '
+                segment_output, prev_s = self._inference_segment(text_segment, prev_s, ref_s, alpha, beta, t, diffusion_steps, embedding_scale, phonemize)
+                segments.append(segment_output)
+            output = np.concatenate(segments)
         else:
-            phoneme_string = text
+            output, _ = self._inference_segment(text, None, ref_s, alpha, beta, t, diffusion_steps, embedding_scale, phonemize)
 
-        textcleaner = TextCleaner()  # TODO: look into removing
-        tokens = textcleaner(phoneme_string)
-        tokens.insert(0, 0)
-        tokens = torch.LongTensor(tokens).to(self.device).unsqueeze(0)
-
-        with torch.no_grad():
-            input_lengths = torch.LongTensor([tokens.shape[-1]]).to(self.device)
-            text_mask = length_to_mask(input_lengths).to(self.device)
-
-            t_en = self.model.text_encoder(tokens, input_lengths, text_mask)
-            bert_dur = self.model.bert(tokens, attention_mask=(~text_mask).int())
-            d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2)
-
-            s_pred = self.sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(self.device),
-                                  embedding=bert_dur,
-                                  embedding_scale=embedding_scale,
-                                  features=ref_s, # reference from the same speaker as the embedding
-                                  num_steps=diffusion_steps).squeeze(1)
-
-            s = s_pred[:, 128:]
-            ref = s_pred[:, :128]
-
-            ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-            s = beta * s + (1 - beta)  * ref_s[:, 128:]
-
-            # duration prediction
-            d = self.model.predictor.text_encoder(d_en,
-                                                  s, input_lengths, text_mask)
-
-            x, _ = self.model.predictor.lstm(d)
-            duration = self.model.predictor.duration_proj(x)
-
-            duration = torch.sigmoid(duration).sum(axis=-1)
-            pred_dur = torch.round(duration.squeeze()).clamp(min=1)
-
-            pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
-            c_frame = 0
-            for i in range(pred_aln_trg.size(0)):
-                pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
-                c_frame += int(pred_dur[i].data)
-
-            # encode prosody
-            en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(self.device))
-            if self.model_params.decoder.type == "hifigan":
-                asr_new = torch.zeros_like(en)
-                asr_new[:, :, 0] = en[:, :, 0]
-                asr_new[:, :, 1:] = en[:, :, 0:-1]
-                en = asr_new
-
-            F0_pred, N_pred = self.model.predictor.F0Ntrain(en, s)
-
-            asr = (t_en @ pred_aln_trg.unsqueeze(0).to(self.device))
-            if self.model_params.decoder.type == "hifigan":
-                asr_new = torch.zeros_like(asr)
-                asr_new[:, :, 0] = asr[:, :, 0]
-                asr_new[:, :, 1:] = asr[:, :, 0:-1]
-                asr = asr_new
-
-            out = self.model.decoder(asr,
-                                     F0_pred, N_pred, ref.squeeze().unsqueeze(0))
-
-        output = out.squeeze().cpu().numpy()[..., :-100] # weird pulse at the end of the model, need to be fixed later
         if output_wav_file:
             scipy.io.wavfile.write(output_wav_file, rate=output_sample_rate, data=output)
         return output
 
-    def long_inference(self,
-                       text: str,
-                       target_voice_path=None,
-                       output_wav_file=None,
-                       output_sample_rate=24000,
-                       alpha=0.3,
-                       beta=0.7,
-                       t=0.7,
-                       diffusion_steps=5,
-                       embedding_scale=1,
-                       ref_s=None,
-                       phonemize=True):
+    def _inference_segment(self,
+                           text,
+                           prev_s,
+                           ref_s,
+                           alpha=0.3,
+                           beta=0.7,
+                           t=0.7,
+                           diffusion_steps=5,
+                           embedding_scale=1,
+                           phonemize=True):
         """
-        Inference for longform text. Used automatically in inference() when needed.
-        :param text: Input text to turn into speech.
-        :param target_voice_path: Path to audio file of target voice to clone.
-        :param output_wav_file: Name of output audio file (if output WAV file is desired).
-        :param output_sample_rate: Output sample rate (default 24000).
-        :param alpha: Determines timbre of speech, higher means style is more suitable to text than to the target voice.
-        :param beta: Determines prosody of speech, higher means style is more suitable to text than to the target voice.
-        :param t: Determines consistency of style across inference segments (0 lowest, 1 highest)
-        :param diffusion_steps: The more the steps, the more diverse the samples are, with the cost of speed.
-        :param embedding_scale: Higher scale means style is more conditional to the input text and hence more emotional.
-        :param ref_s: Pre-computed style vector to pass directly.
-        :param phonemize: Phonemize text. Defaults to True
-        :return: concatenated audio data as a Numpy array (will also create the WAV file if output_wav_file was set).
-        """
-
-        if ref_s is None:
-            # default to clone https://styletts2.github.io/wavs/LJSpeech/OOD/GT/00001.wav voice from LibriVox (public domain)
-            if not target_voice_path or not Path(target_voice_path).exists():
-                print("Cloning default target voice...")
-                target_voice_path = cached_path(DEFAULT_TARGET_VOICE_URL)
-            ref_s = self.compute_style(target_voice_path)  # target style vector
-
-        text_segments = segment_text(text)
-        segments = []
-        prev_s = None
-        for text_segment in text_segments:
-            # Address cut-off sentence issue due to langchain text splitter
-            if text_segment[-1] != '.':
-                text_segment += ', '
-            segment_output, prev_s = self.long_inference_segment(text_segment,
-                                                                 prev_s,
-                                                                 ref_s,
-                                                                 alpha=alpha,
-                                                                 beta=beta,
-                                                                 t=t,
-                                                                 diffusion_steps=diffusion_steps,
-                                                                 embedding_scale=embedding_scale,
-                                                                 phonemize=phonemize)
-            segments.append(segment_output)
-        output = np.concatenate(segments)
-        if output_wav_file:
-            scipy.io.wavfile.write(output_wav_file, rate=output_sample_rate, data=output)
-        return output
-
-    def long_inference_segment(self,
-                               text,
-                               prev_s,
-                               ref_s,
-                               alpha=0.3,
-                               beta=0.7,
-                               t=0.7,
-                               diffusion_steps=5,
-                               embedding_scale=1,
-                               phonemize=True):
-        """
-        Performs inference for segment of longform text; see long_inference()
-        :param text: Input text
-        :param prev_s: Style vector of previous speech segment (used to keep voice consistent in longform inference)
-        :param ref_s: Pre-computed style vector of target voice to clone
-        :param alpha: Determines timbre of speech, higher means style is more suitable to text than to the target voice.
-        :param beta: Determines prosody of speech, higher means style is more suitable to text than to the target voice.
-        :param t: Determines consistency of style across inference segments (0 lowest, 1 highest)
-        :param diffusion_steps: The more the steps, the more diverse the samples are, with the cost of speed.
-        :param embedding_scale: Higher scale means style is more conditional to the input text and hence more emotional.
-        :param phonemize: Phonemize text? If not, expects that text is already phonemized
-        :return: audio data as a Numpy array
+        Performs inference for a segment of text
         """
         if phonemize:
             text = text.strip()
@@ -408,7 +269,7 @@ class StyleTTS2:
             s_pred = self.sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(self.device),
                                   embedding=bert_dur,
                                   embedding_scale=embedding_scale,
-                                  features=ref_s, # reference from the same speaker as the embedding
+                                  features=ref_s,
                                   num_steps=diffusion_steps).squeeze(1)
 
             if prev_s is not None:
@@ -418,20 +279,17 @@ class StyleTTS2:
             s = s_pred[:, 128:]
             ref = s_pred[:, :128]
 
-            ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-            s = beta * s + (1 - beta)  * ref_s[:, 128:]
+            ref = alpha * ref + (1 - alpha) * ref_s[:, :128]
+            s = beta * s + (1 - beta) * ref_s[:, 128:]
 
-            s_pred = torch.cat([ref, s], dim=-1)
-
-            d = self.model.predictor.text_encoder(d_en,
-                                             s, input_lengths, text_mask)
+            # duration prediction
+            d = self.model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
             x, _ = self.model.predictor.lstm(d)
             duration = self.model.predictor.duration_proj(x)
 
             duration = torch.sigmoid(duration).sum(axis=-1)
             pred_dur = torch.round(duration.squeeze()).clamp(min=1)
-
 
             pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
             c_frame = 0
@@ -456,7 +314,6 @@ class StyleTTS2:
                 asr_new[:, :, 1:] = asr[:, :, 0:-1]
                 asr = asr_new
 
-            out = self.model.decoder(asr,
-                                F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+            out = self.model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
         return out.squeeze().cpu().numpy()[..., :-100], s_pred
