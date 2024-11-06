@@ -40,7 +40,7 @@ BERT_CONFIG_URL = "https://github.com/yl4579/StyleTTS2/raw/main/Utils/PLBERT/con
 
 DEFAULT_TARGET_VOICE_URL = "https://styletts2.github.io/wavs/LJSpeech/OOD/GT/00001.wav"
 
-SINGLE_INFERENCE_MAX_LEN = 420
+SINGLE_INFERENCE_MAX_LEN = 380
 
 to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
