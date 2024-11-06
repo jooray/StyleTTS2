@@ -21,5 +21,5 @@ class TextCleaner:
             try:
                 indexes.append(self.word_index_dictionary[char])
             except KeyError:
-                print(text)
+                print(f"Error: Character {char} not in dictionary while parsing {text}")
         return indexes
