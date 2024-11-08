@@ -1,6 +1,6 @@
 from nltk.tokenize import word_tokenize
 import nltk
-nltk.download('punkt')
+nltk.download('punkt', quiet=True)
 
 from pathlib import Path
 import librosa
